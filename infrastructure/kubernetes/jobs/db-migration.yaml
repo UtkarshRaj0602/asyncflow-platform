@@ -1,0 +1,33 @@
+apiVersion: batch/v1
+kind: Job
+
+metadata:
+  name: asyncflow-db-migration
+  namespace: asyncflow
+
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+
+  template:
+    metadata:
+      labels:
+        app: asyncflow-db-migration
+
+    spec:
+      restartPolicy: Never
+
+      containers:
+        - name: db-migration
+          image: <AWS_ACCOUNT_ID>.dkr.ecr.ap-south-1.amazonaws.com/asyncflow-stage-backend:IMAGE_TAG
+
+          command:
+            - alembic
+            - upgrade
+            - head
+
+          envFrom:
+            - configMapRef:
+                name: backend-config
+            - secretRef:
+                name: backend-secret

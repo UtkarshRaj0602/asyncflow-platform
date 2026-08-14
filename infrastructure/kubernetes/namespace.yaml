@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: asyncflow
+  labels:
+    app.kubernetes.io/part-of: asyncflow-platform
+    app.kubernetes.io/managed-by: kubectl

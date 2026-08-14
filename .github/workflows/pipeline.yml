@@ -1,0 +1,1122 @@
+name: AsyncFlow Pipeline
+on:
+  push:
+    branches:
+      - stage
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+
+jobs:
+
+  # =========================================================
+  # TERRAFORM
+  # =========================================================
+
+  terraform:
+    name: Terraform Plan & Apply
+    runs-on: ubuntu-latest
+
+    outputs:
+      cluster_name: ${{ steps.terraform-output.outputs.cluster_name }}
+
+    defaults:
+      run:
+        working-directory: infrastructure/terraform
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+
+###################Inscpect GitHub OIDC claims########################
+
+      - name: Inspect GitHub OIDC claims
+        run: |
+          echo "========== GITHUB CONTEXT =========="
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Ref:        $GITHUB_REF"
+          echo "Branch:     $GITHUB_REF_NAME"
+          echo "Event:      $GITHUB_EVENT_NAME"
+          echo "SHA:        $GITHUB_SHA"
+
+          echo ""
+          echo "========== OIDC TOKEN =========="
+
+          RESPONSE=$(curl -sSf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            -H "Accept: application/json; api-version=2.0" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
+
+          TOKEN=$(echo "$RESPONSE" | jq -r '.value')
+
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "Failed to obtain OIDC token"
+            exit 1
+          fi
+
+          PAYLOAD=$(echo "$TOKEN" | cut -d '.' -f 2)
+
+          case $((${#PAYLOAD} % 4)) in
+            2) PAYLOAD="${PAYLOAD}==" ;;
+            3) PAYLOAD="${PAYLOAD}=" ;;
+          esac
+
+          echo "$PAYLOAD" | base64 -d 2>/dev/null | jq '{
+            iss,
+            aud,
+            sub,
+            repository,
+            repository_owner,
+            repository_id,
+            repository_owner_id,
+            ref,
+            ref_type,
+            event_name
+          }'
+
+  ##############################################################3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Format Check
+        run: |
+          terraform fmt -check -recursive
+
+###########################Added forced terraform clean##########################
+      - name: Clean Terraform
+        run: |
+          rm -rf .terraform
+          rm -f .terraform.lock.hcl
+          rm -rf ~/.terraform.d/plugin-cache
+
+      - name: Terraform Init
+        run: |
+          echo "========== TERRAFORM INIT =========="
+          terraform init -input=false
+          echo "========== TERRAFORM INIT COMPLETE =========="
+
+      - name: Terraform Validate
+        run: |
+          echo "========== TERRAFORM VALIDATE =========="
+          terraform validate
+          echo "========== TERRAFORM VALIDATE COMPLETE =========="
+
+
+######################################################
+
+      # - name: Verify Terraform Node Scaling Variables
+      #   run: |
+      #     echo "========== STAGE TFVARS =========="
+      #     grep -E '^(desired_size|min_size|max_size)' \
+      #       environments/stage/terraform.tfvars
+
+      #     echo ""
+      #     echo "========== TERRAFORM VARIABLE VALUES =========="
+      #     terraform plan \
+      #       -var-file="environments/stage/terraform.tfvars" \
+      #       -target='module.eks' \
+      #       -no-color | grep -A 15 -B 5 'aws_eks_node_group'
+            
+    # ==========================================
+    # PHASE 1 - AWS INFRASTRUCTURE
+    # ==========================================
+      - name: Terraform Infrastructure Plan
+        run: |
+          echo "========== TERRAFORM PLAN =========="
+          echo "Working directory:"
+          pwd
+
+          echo ""
+          echo "========== TERRAFORM VERSION =========="
+          terraform version
+
+          echo ""
+          echo "========== STAGE TFVARS =========="
+          grep -E '^(cluster_name|desired_size|min_size|max_size)' \
+            environments/stage/terraform.tfvars || true
+
+          echo ""
+          echo "========== TERRAFORM PLAN START =========="
+
+          terraform plan \
+            -var-file="environments/stage/terraform.tfvars" \
+            -target=module.vpc \
+            -target=module.security \
+            -target=module.iam \
+            -target=module.ecr \
+            -target=module.sqs \
+            -target=module.secrets \
+            -target=module.rds \
+            -target=module.redis \
+            -target=module.eks \
+            -target=module.irsa \
+            -out=stage-infrastructure.tfplan
+
+          echo ""
+          echo "========== TERRAFORM PLAN COMPLETE =========="
+
+      - name: Terraform Infrastructure Apply
+        run: |
+          echo "========== TERRAFORM APPLY =========="
+          echo "Applying stage infrastructure plan..."
+
+          terraform apply \
+            -input=false \
+            -auto-approve \
+            stage-infrastructure.tfplan
+
+          echo ""
+          echo "========== TERRAFORM APPLY COMPLETE =========="
+
+    # ==========================================
+    # WAIT FOR EKS
+    # ==========================================
+      - name: Wait for EKS
+        run: |
+          CLUSTER_NAME=$(terraform output -raw cluster_name)
+
+          echo "Waiting for EKS cluster: $CLUSTER_NAME"
+
+          for i in {1..30}; do
+
+            STATUS=$(aws eks describe-cluster \
+              --name "$CLUSTER_NAME" \
+              --region "$AWS_REGION" \
+              --query 'cluster.status' \
+              --output text)
+
+            echo "EKS status: $STATUS"
+
+            if [ "$STATUS" = "ACTIVE" ]; then
+              echo "EKS cluster is ACTIVE"
+              break
+            fi
+
+            if [ "$i" -eq 30 ]; then
+              echo "EKS cluster did not become ACTIVE"
+              exit 1
+            fi
+
+            sleep 20
+
+          done
+
+          # ==========================================
+      # CONFIGURE KUBECTL
+      # ==========================================
+
+      - name: Install kubectl
+        run: |
+          KUBECTL_VERSION=$(curl -L -s https://dl.k8s.io/release/stable.txt)
+
+          echo "Installing kubectl ${KUBECTL_VERSION}"
+
+          curl -LO \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+
+      - name: Configure kubectl
+        run: |
+          CLUSTER_NAME=$(terraform output -raw cluster_name)
+
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$CLUSTER_NAME"
+
+      - name: Verify Kubernetes Access
+        run: |
+          kubectl cluster-info
+
+    # ==========================================
+      # PHASE 2A - HELM COMPONENTS
+      # ==========================================
+
+      - name: Terraform Helm Plan
+        run: |
+          terraform plan \
+            -var-file="environments/stage/terraform.tfvars" \
+            -target=module.helm \
+            -out=stage-helm.tfplan
+
+      - name: Terraform Helm Apply
+        run: |
+          terraform apply \
+            -auto-approve \
+            stage-helm.tfplan
+
+      # ==========================================
+      # PHASE 2B - KUBERNETES RESOURCES
+      # ==========================================
+
+      - name: Verify External Secrets CRDs
+        run: |
+          echo "Checking External Secrets CRDs..."
+
+          for i in {1..30}; do
+            if kubectl get crd secretstores.external-secrets.io >/dev/null 2>&1 && \
+               kubectl get crd externalsecrets.external-secrets.io >/dev/null 2>&1; then
+              echo "External Secrets CRDs are available."
+              break
+            fi
+
+            if [ "$i" -eq 30 ]; then
+              echo "External Secrets CRDs were not created."
+              kubectl get crd | grep external-secrets || true
+              exit 1
+            fi
+
+            echo "Waiting for External Secrets CRDs... attempt $i/30"
+            sleep 10
+          done
+
+    # ==========================================
+    # PHASE 2C - TERRAFORM KUBERNETES RESOURCES 
+    # ==========================================
+
+      - name: Terraform Kubernetes Resources Plan
+        run: |
+          echo "========== TERRAFORM KUBERNETES RESOURCES PLAN =========="
+
+          terraform plan \
+            -var-file="environments/stage/terraform.tfvars" \
+            -target=module.namespace \
+            -target=module.configmap \
+            -target=module.k8s_secrets \
+            -out=stage-kubernetes.tfplan
+
+      - name: Terraform Kubernetes Resources Apply
+        run: |
+          echo "========== TERRAFORM KUBERNETES RESOURCES APPLY =========="
+
+          terraform apply \
+            -auto-approve \
+            stage-kubernetes.tfplan
+
+    # ==========================================
+    # Helm installation for Cluster Autoscaler
+    # ==========================================
+      - name: Prepare Helm for Cluster Autoscaler
+        run: |
+          echo "========== INSTALL HELM =========="
+
+          if ! command -v helm >/dev/null 2>&1; then
+            curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          fi
+
+          echo "========== HELM VERSION =========="
+          helm version
+
+          echo "========== ADD AUTOSCALER REPOSITORY =========="
+          helm repo add autoscaler https://kubernetes.github.io/autoscaler
+
+          echo "========== UPDATE HELM REPOSITORIES =========="
+          helm repo update
+
+          echo "========== CLUSTER AUTOSCALER CHART =========="
+          helm search repo autoscaler/cluster-autoscaler --versions | head -10
+
+    # =========================================================================
+    # Terraform Cluster Autoscaler Plan & Apply and phase - 2b install
+    # =========================================================================
+
+      - name: Terraform Cluster Autoscaler Plan
+        run: |
+          echo "========== CLUSTER AUTOSCALER PLAN =========="
+
+          terraform plan \
+            -var-file="environments/stage/terraform.tfvars" \
+            -target=module.cluster_autoscaler \
+            -out=stage-cluster-autoscaler.tfplan
+
+      - name: Terraform Cluster Autoscaler Apply
+        run: |
+          echo "========== CLUSTER AUTOSCALER APPLY =========="
+
+          terraform apply \
+            -auto-approve \
+            stage-cluster-autoscaler.tfplan
+
+    # ==========================================
+    # OUTPUTS
+    # ==========================================
+      - name: Get Terraform Outputs
+        id: terraform-output
+        run: |
+          CLUSTER_NAME=$(terraform output -raw cluster_name)
+
+          if [ -z "$CLUSTER_NAME" ]; then
+            echo "EKS cluster name is empty"
+            exit 1
+          fi
+
+          echo "EKS Cluster: $CLUSTER_NAME"
+          echo "cluster_name=$CLUSTER_NAME" >> "$GITHUB_OUTPUT"
+
+# =========================================================
+# TERRAFORM ROLLBACK
+# =========================================================
+
+  # terraform-rollback:
+  #   name: Terraform Rollback
+  #   runs-on: ubuntu-latest
+
+  #   if: ${{ always() && needs.terraform.result == 'failure' }}
+
+  #   needs:
+  #     - terraform
+
+  #   defaults:
+  #     run:
+  #       working-directory: infrastructure/terraform
+
+  #   steps:
+
+  #     # =====================================================
+  #     # CHECKOUT
+  #     # =====================================================
+
+  #     - name: Checkout repository
+  #       uses: actions/checkout@v6
+
+  #     # =====================================================
+  #     # AWS CREDENTIALS
+  #     # =====================================================
+
+  #     - name: Configure AWS credentials
+  #       uses: aws-actions/configure-aws-credentials@v6
+  #       with:
+  #         role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+  #         aws-region: ${{ env.AWS_REGION }}
+
+  #     # =====================================================
+  #     # VERIFY AWS
+  #     # =====================================================
+
+  #     - name: Verify AWS identity
+  #       run: |
+  #         echo "========== AWS IDENTITY =========="
+  #         aws sts get-caller-identity
+
+  #     # =====================================================
+  #     # TERRAFORM
+  #     # =====================================================
+
+  #     - name: Setup Terraform
+  #       uses: hashicorp/setup-terraform@v3
+
+  #     - name: Terraform Init
+  #       run: |
+  #         echo "========== TERRAFORM INIT =========="
+  #         terraform init
+
+  #     # =====================================================
+  #     # FORCE DELETE STAGE DATABASE SECRET
+  #     # =====================================================
+
+  #     - name: Force delete Stage database secret
+  #       run: |
+  #         echo "========== FORCE DELETE STAGE DATABASE SECRET =========="
+
+  #         SECRET_NAME="asyncflow-stage-database"
+
+  #         echo "Checking whether ${SECRET_NAME} exists..."
+
+  #         if aws secretsmanager describe-secret \
+  #           --secret-id "${SECRET_NAME}" \
+  #           --region "${AWS_REGION}" >/dev/null 2>&1; then
+
+  #           echo "Secret exists."
+  #           echo "Force deleting ${SECRET_NAME}..."
+
+  #           aws secretsmanager delete-secret \
+  #             --secret-id "${SECRET_NAME}" \
+  #             --force-delete-without-recovery \
+  #             --region "${AWS_REGION}"
+
+  #           echo "Secret deletion requested."
+
+  #         else
+
+  #           echo "Secret does not exist. Nothing to delete."
+
+  #         fi
+
+  #         echo ""
+  #         echo "Waiting for secret deletion..."
+
+  #         for i in {1..12}; do
+
+  #           if aws secretsmanager describe-secret \
+  #             --secret-id "${SECRET_NAME}" \
+  #             --region "${AWS_REGION}" >/dev/null 2>&1; then
+
+  #             echo "Secret still exists. Attempt ${i}/12"
+  #             sleep 5
+
+  #           else
+
+  #             echo "Secret is no longer present."
+  #             break
+
+  #           fi
+
+  #         done
+
+  #         echo ""
+  #         echo "========== SECRET CLEANUP COMPLETE =========="
+
+  #     # =====================================================
+  #     # TERRAFORM DESTROY
+  #     # =====================================================
+
+  #     - name: Terraform Rollback
+  #       run: |
+  #         echo "========================================================="
+  #         echo " TERRAFORM ROLLBACK"
+  #         echo "========================================================="
+
+  #         echo ""
+  #         echo "Terraform failed."
+  #         echo "Starting rollback of Terraform-managed stage infrastructure..."
+  #         echo ""
+
+  #         terraform destroy \
+  #           -auto-approve \
+  #           -var-file="environments/stage/terraform.tfvars"
+
+  #     # =====================================================
+  #     # VERIFY TERRAFORM STATE
+  #     # =====================================================
+
+  #     - name: Verify Terraform State
+  #       if: always()
+  #       run: |
+  #         echo "========================================================="
+  #         echo " REMAINING TERRAFORM RESOURCES"
+  #         echo "========================================================="
+
+  #         terraform state list || true
+
+  # =========================================================
+  # BACKEND #
+  # =========================================================
+
+  backend:
+    name: Backend Validation
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: backend/api
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Python syntax check
+        run: |
+          python -m compileall app
+
+
+  # =========================================================
+  # WORKER
+  # =========================================================
+
+  worker:
+    name: Worker Validation
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: backend/worker
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Python syntax check
+        run: |
+          python -m compileall .
+
+
+  # =========================================================
+  # FRONTEND
+  # =========================================================
+
+  frontend:
+    name: Frontend Build
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          npm ci
+
+      - name: Build frontend
+        run: |
+          npm run build
+
+
+  # =========================================================
+  # DOCKER & ECR
+  # =========================================================
+
+  docker:
+    name: Docker Build & Push
+    runs-on: ubuntu-latest
+
+    needs:
+      - terraform
+      - backend
+      - worker
+      - frontend
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set ECR Registry
+        run: |
+          echo "ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}" >> "$GITHUB_ENV"
+
+      # - name: Build Backend Image
+      #   run: |
+      #     docker build \
+      #       -t asyncflow-stage-backend-api:$GITHUB_SHA \
+      #       ./backend/api
+
+      # - name: Build Worker Image
+      #   run: |
+      #     docker build \
+      #       -t asyncflow-stage-backend-worker:$GITHUB_SHA \
+      #       ./backend/worker
+
+      # - name: Build Frontend Image
+      #   run: |
+      #     docker build \
+      #       -t asyncflow-stage-frontend:$GITHUB_SHA \
+      #       ./frontend
+
+      # - name: Tag Backend Image
+      #   run: |
+      #     docker tag \
+      #       asyncflow-stage-backend-api:$GITHUB_SHA \
+      #       $ECR_REGISTRY/asyncflow-stage-backend:$GITHUB_SHA
+
+      # - name: Tag Worker Image
+      #   run: |
+      #     docker tag \
+      #       asyncflow-stage-backend-worker:$GITHUB_SHA \
+      #       $ECR_REGISTRY/asyncflow-stage-worker:$GITHUB_SHA
+
+      # - name: Tag Frontend Image
+      #   run: |
+      #     docker tag \
+      #       asyncflow-stage-frontend:$GITHUB_SHA \
+      #       $ECR_REGISTRY/asyncflow-stage-frontend:$GITHUB_SHA
+
+      # - name: Push Backend Image
+      #   run: |
+      #     docker push \
+      #       $ECR_REGISTRY/asyncflow-stage-backend:$GITHUB_SHA
+
+      # - name: Push Worker Image
+      #   run: |
+      #     docker push \
+      #       $ECR_REGISTRY/asyncflow-stage-worker:$GITHUB_SHA
+
+      # - name: Push Frontend Image
+      #   run: |
+      #     docker push \
+      #       $ECR_REGISTRY/asyncflow-stage-frontend:$GITHUB_SHA
+
+      - name: Build Backend Image
+        run: |
+          docker build \
+            -t "${ECR_REGISTRY}/asyncflow-stage-backend:${GITHUB_SHA}" \
+            ./backend/api
+
+      - name: Build Worker Image
+        run: |
+          docker build \
+            -t "${ECR_REGISTRY}/asyncflow-stage-worker:${GITHUB_SHA}" \
+            ./backend/worker
+
+      - name: Build Frontend Image
+        run: |
+          docker build \
+            -t "${ECR_REGISTRY}/asyncflow-stage-frontend:${GITHUB_SHA}" \
+            ./frontend
+
+      - name: Push Backend Image
+        run: |
+          docker push \
+            "${ECR_REGISTRY}/asyncflow-stage-backend:${GITHUB_SHA}"
+
+      - name: Push Worker Image
+        run: |
+          docker push \
+            "${ECR_REGISTRY}/asyncflow-stage-worker:${GITHUB_SHA}"
+
+      - name: Push Frontend Image
+        run: |
+          docker push \
+            "${ECR_REGISTRY}/asyncflow-stage-frontend:${GITHUB_SHA}"
+
+      - name: Display Image References
+        run: |
+          echo "Backend:"
+          echo "$ECR_REGISTRY/asyncflow-stage-backend:$GITHUB_SHA"
+
+          echo "Worker:"
+          echo "$ECR_REGISTRY/asyncflow-stage-worker:$GITHUB_SHA"
+
+          echo "Frontend:"
+          echo "$ECR_REGISTRY/asyncflow-stage-frontend:$GITHUB_SHA"
+
+  # =========================================================
+  # EKS DEPLOYMENT
+  # =========================================================
+
+  eks:
+    name: Deploy to EKS
+    runs-on: ubuntu-latest
+
+    needs:
+      - terraform
+      - docker
+
+    steps:
+
+      # -------------------------------------------------------
+      # CHECKOUT
+      # -------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+
+      # -------------------------------------------------------
+      # AWS AUTHENTICATION
+      # -------------------------------------------------------
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+
+      # -------------------------------------------------------
+      # VERIFY AWS
+      # -------------------------------------------------------
+
+      - name: Verify AWS identity
+        run: |
+          aws sts get-caller-identity
+
+
+      # -------------------------------------------------------
+      # GET EKS CLUSTER NAME
+      # -------------------------------------------------------
+
+      - name: Set EKS cluster name
+        run: |
+          echo "EKS_CLUSTER_NAME=${{ needs.terraform.outputs.cluster_name }}" >> "$GITHUB_ENV"
+
+      - name: Verify EKS cluster
+        run: |
+          if [ -z "$EKS_CLUSTER_NAME" ]; then
+            echo "EKS_CLUSTER_NAME is empty"
+            exit 1
+          fi
+
+          echo "EKS Cluster: $EKS_CLUSTER_NAME"
+
+          aws eks describe-cluster \
+            --name "$EKS_CLUSTER_NAME" \
+            --region "$AWS_REGION" \
+            --query "cluster.{name:name,status:status,version:version}" \
+            --output table
+
+
+      # -------------------------------------------------------
+      # INSTALL KUBECTL
+      # -------------------------------------------------------
+
+      - name: Install kubectl
+        run: |
+          KUBECTL_VERSION=$(curl -L -s https://dl.k8s.io/release/stable.txt)
+
+          echo "Installing kubectl ${KUBECTL_VERSION}"
+
+          curl -LO \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+
+          chmod +x kubectl
+
+          sudo mv kubectl /usr/local/bin/kubectl
+
+      - name: Verify kubectl
+        run: |
+          kubectl version --client
+
+
+      # -------------------------------------------------------
+      # CONFIGURE KUBECTL FOR EKS
+      # -------------------------------------------------------
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+
+      # -------------------------------------------------------
+      # VERIFY EKS ACCESS
+      # -------------------------------------------------------
+
+      - name: Verify Kubernetes access
+        run: |
+          kubectl cluster-info
+
+      - name: Get Kubernetes nodes
+        run: |
+          kubectl get nodes -o wide
+
+
+      # -------------------------------------------------------
+      # ENSURE Asyncflow NAMESPACE EXISTS
+      # -------------------------------------------------------
+
+      - name: Ensure AsyncFlow Namespace
+        run: |
+          echo "========== CHECKING AsyncFlow NAMESPACE =========="
+
+          if kubectl get namespace asyncflow >/dev/null 2>&1; then
+            echo "Namespace 'asyncflow' already exists."
+          else
+            echo "Namespace 'asyncflow' does not exist."
+            echo "Creating namespace from manifest..."
+
+            kubectl apply \
+              -f infrastructure/kubernetes/namespace.yml
+          fi
+
+          echo ""
+          echo "========== WAITING FOR NAMESPACE =========="
+
+          kubectl wait \
+            --for=jsonpath='{.status.phase}'=Active \
+            namespace/asyncflow \
+            --timeout=60s
+
+          echo ""
+          echo "========== NAMESPACE STATUS =========="
+
+          kubectl get namespace asyncflow
+
+
+      # -------------------------------------------------------
+      # APPLY KUBERNETES MANIFESTS
+      # -------------------------------------------------------
+
+      - name: Apply Kubernetes manifests
+        run: |
+          echo "========== APPLYING KUBERNETES MANIFESTS =========="
+
+          kubectl apply \
+            -f infrastructure/kubernetes/backend/
+
+          kubectl apply \
+            -f infrastructure/kubernetes/frontend/
+
+          kubectl apply \
+            -f infrastructure/kubernetes/worker/
+
+          kubectl apply \
+            -f infrastructure/kubernetes/ingress/
+
+          echo ""
+          echo "========== KUBERNETES RESOURCES =========="
+
+          kubectl get all -n asyncflow
+
+      # -------------------------------------------------------
+      # Database migration job
+      # -------------------------------------------------------
+
+      - name: Run Database Migrations
+        run: |
+          echo "========== RUNNING DATABASE MIGRATION =========="
+
+          echo "Using backend image:"
+          echo "<AWS_ACCOUNT_ID>.dkr.ecr.ap-south-1.amazonaws.com/asyncflow-stage-backend:${GITHUB_SHA}"
+
+          echo "Deleting previous migration job if it exists..."
+          kubectl delete job asyncflow-db-migration \
+            -n asyncflow \
+            --ignore-not-found=true
+
+          echo "Preparing migration manifest..."
+          sed -i "s|IMAGE_TAG|${GITHUB_SHA}|g" \
+            infrastructure/kubernetes/jobs/db-migration.yaml
+
+          echo "Migration image:"
+          grep "image:" infrastructure/kubernetes/jobs/db-migration.yaml
+
+          echo "Applying migration job..."
+          kubectl apply \
+            -f infrastructure/kubernetes/jobs/db-migration.yaml
+
+          echo "Waiting for migration to complete..."
+          kubectl wait \
+            --for=condition=complete \
+            job/asyncflow-db-migration \
+            -n asyncflow \
+            --timeout=180s
+
+          echo "========== MIGRATION LOGS =========="
+          kubectl logs \
+            job/asyncflow-db-migration \
+            -n asyncflow
+
+          echo "========== MIGRATION COMPLETE =========="
+
+
+      # -------------------------------------------------------
+      # UPDATE BACKEND IMAGE
+      # -------------------------------------------------------
+
+      - name: Update Backend Image
+        run: |
+          kubectl set image \
+            "deployment/backend" \
+            "backend=<AWS_ACCOUNT_ID>.dkr.ecr.ap-south-1.amazonaws.com/asyncflow-stage-backend:${GITHUB_SHA}" \
+            --namespace=asyncflow
+
+
+      # -------------------------------------------------------
+      # UPDATE WORKER IMAGE
+      # -------------------------------------------------------
+
+      - name: Update Worker Image
+        run: |
+          kubectl set image \
+            "deployment/worker" \
+            "worker=<AWS_ACCOUNT_ID>.dkr.ecr.ap-south-1.amazonaws.com/asyncflow-stage-worker:${GITHUB_SHA}" \
+            --namespace=asyncflow
+
+
+      # -------------------------------------------------------
+      # UPDATE FRONTEND IMAGE
+      # -------------------------------------------------------
+
+      - name: Update Frontend Image
+        run: |
+          kubectl set image \
+            "deployment/frontend" \
+            "frontend=<AWS_ACCOUNT_ID>.dkr.ecr.ap-south-1.amazonaws.com/asyncflow-stage-frontend:${GITHUB_SHA}" \
+            --namespace=asyncflow
+
+
+      # -------------------------------------------------------
+      # VERIFY BACKEND ROLLOUT
+      # -------------------------------------------------------
+
+      # - name: Verify Backend Rollout
+      #   run: |
+      #     kubectl rollout status \
+      #       deployment/backend \
+      #       -n asyncflow \
+      #       --timeout=5m
+
+
+      # -------------------------------------------------------
+      # VERIFY WORKER ROLLOUT
+      # -------------------------------------------------------
+
+      # - name: Verify Worker Rollout
+      #   run: |
+      #     kubectl rollout status \
+      #       deployment/worker \
+      #       -n asyncflow \
+      #       --timeout=5m
+
+
+      # -------------------------------------------------------
+      # VERIFY FRONTEND ROLLOUT
+      # -------------------------------------------------------
+
+      # - name: Verify Frontend Rollout
+      #   run: |
+      #     kubectl rollout status \
+      #       deployment/frontend \
+      #       -n asyncflow \
+      #       --timeout=5m
+
+
+      # -------------------------------------------------------
+      # VERIFY PODS
+      # -------------------------------------------------------
+
+      - name: Verify Pods
+        run: |
+          kubectl get pods \
+            -n asyncflow \
+            -o wide
+
+
+      # -------------------------------------------------------
+      # VERIFY SERVICES
+      # -------------------------------------------------------
+
+      - name: Verify Services
+        run: |
+          kubectl get svc \
+            -n asyncflow
+
+
+      # -------------------------------------------------------
+      # VERIFY INGRESS
+      # -------------------------------------------------------
+
+      - name: Verify Ingress
+        run: |
+          kubectl get ingress \
+            -n asyncflow
+
+
+      # -------------------------------------------------------
+      # FAILURE DIAGNOSTICS
+      # -------------------------------------------------------
+
+      - name: Collect Kubernetes diagnostics
+        if: failure()
+        run: |
+          echo "========== PODS =========="
+          kubectl get pods -n asyncflow -o wide || true
+
+          echo "========== DEPLOYMENTS =========="
+          kubectl get deployments -n asyncflow || true
+
+          echo "========== SERVICES =========="
+          kubectl get svc -n asyncflow || true
+
+          echo "========== INGRESS =========="
+          kubectl get ingress -n asyncflow || true
+
+          echo "========== EVENTS =========="
+          kubectl get events \
+            -n asyncflow \
+            --sort-by=.lastTimestamp || true
+
+          echo "========== BACKEND DESCRIPTION =========="
+          kubectl describe deployment backend \
+            -n asyncflow || true
+
+          echo "========== WORKER DESCRIPTION =========="
+          kubectl describe deployment worker \
+            -n asyncflow || true
+
+          echo "========== FRONTEND DESCRIPTION =========="
+          kubectl describe deployment frontend \
+            -n asyncflow || true
+
+          echo "========== BACKEND LOGS =========="
+          kubectl logs \
+            deployment/backend \
+            -n asyncflow \
+            --all-containers=true \
+            --tail=100 || true
+
+          echo "========== WORKER LOGS =========="
+          kubectl logs \
+            deployment/worker \
+            -n asyncflow \
+            --all-containers=true \
+            --tail=100 || true
+
+          echo "========== FRONTEND LOGS =========="
+          kubectl logs \
+            deployment/frontend \
+            -n asyncflow \
+            --all-containers=true \
+            --tail=100 || true
+
+
+# -------------------------------------------------------
+# END OF PIPELINE
+# -------------------------------------------------------
